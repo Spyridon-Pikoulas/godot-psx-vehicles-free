@@ -5,9 +5,20 @@ extends Node
 ## (props.json's "layout") shows it on L and walks it on W: WASD and the mouse, Shift to run, E to
 ## open what is in front, F for the torch, Esc to stop. A pack with guns (a held prop's "gun" in
 ## props.json) has a range on G: its targets downrange, its ammunition on the floor to walk over,
-## the guns in hand on the wheel or 1 to 9; left button to fire, right to aim, R to reload.
+## the guns in hand on the wheel or 1 to 9; left button to fire, right to aim, R to reload. A pack
+## of melee weapons and tools (a held prop's "melee") has them on the range too, its targets close:
+## left button to swing, right to use (a flashlight lit, a chainsaw started). A pack
+## of machines (a prop's "use" in props.json, run by its scene's machine.gd) is used with E on foot:
+## what the dot is on, taking what it needs from what you carry; the layout's "machines" wire the
+## level's ones together (an id, the ids it needs), its lights can need one, and its "puzzle" is
+## the uses that get its door open. A pack of pickups (a prop's "pickup", run by its scene's
+## pickup.gd) has them taken, saved at or opened the same way, an item held up in inspect.gd as it
+## is taken, and a prop's own on I. The layout's "running" names the pieces whose loop plays in the
+## level (trees swaying, a fire). With a sky in res://sky/ (a PSX Skyboxes panorama and its fog
+## and light, put in the web demo's build), the level is under it.
 
 const PSX_LOOK := "res://addons/psx_look/"
+const SKY := "res://sky/"
 const FLOOR := Color(0.13, 0.12, 0.11)
 const WALL := Color(0.2, 0.19, 0.17)
 const GAP := 0.05
@@ -28,7 +39,11 @@ var dir: String
 var props: Array
 var level: Dictionary
 var walker: CharacterBody3D
-var guns: Array
+var guns: Array  # what the range puts in hand: the guns, and the melee weapons and tools
+var machines := {}  # the level's, by id
+var items: Array = []  # carried
+var inspect: CanvasLayer  # a pickups pack's, for what is taken
+var prompt := Label.new()
 var ranging := false
 var view := Node3D.new()  # the gun in hand, under the camera
 var gun_node: Node3D
@@ -41,6 +56,11 @@ var firing := false
 var wait := 0.0  # until the gun fires again
 var reloading := 0.0
 var reload_time := 1.0
+var swinging := 0.0  # left of the swing in hand
+var swing_time := 1.0
+var struck := false  # this swing's blow has landed
+var using := 0.0  # left of the use in hand
+var lit := false  # what is in hand is on: its use's first half played
 var kick := 0.0
 var sway := Vector2.ZERO
 var bob := 0.0
@@ -55,6 +75,8 @@ var note_left := 0.0
 var torch: SpotLight3D
 var sun := DirectionalLight3D.new()
 var rim := DirectionalLight3D.new()
+var moon := DirectionalLight3D.new()  # the sky's, over the level
+var night: Dictionary  # res://sky/sky.json: its fog colour, light colour and energy
 var index := 0
 var all_view := false
 var world := Node3D.new()
@@ -84,7 +106,7 @@ func _ready() -> void:
 	var data: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(dir + "/props.json"))
 	props = data["props"]
 	level = data.get("layout", {})
-	guns = props.filter(func(p): return p.has("gun"))
+	guns = props.filter(func(p): return p.has("gun") or p.has("melee"))
 	add_child(world)
 	_stage()
 	world.add_child(shown)
@@ -94,6 +116,10 @@ func _ready() -> void:
 	cam.current = true
 	cam.fov = 40
 	_ui()
+	if props.any(func(p): return p.has("pickup")):
+		inspect = load(dir + "/inspect.gd").new()
+		inspect.closed.connect(_inspected)
+		add_child(inspect)
 	if ResourceLoader.exists(PSX_LOOK + "psx_screen.gd"):
 		psx_screen = load(PSX_LOOK + "psx_screen.gd").new()
 		psx_screen.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -139,6 +165,20 @@ func _stage() -> void:
 	wall.position = Vector3(0, 3, -0.002)
 	wall.material_override = _flat(WALL)
 	world.add_child(wall)
+	if FileAccess.file_exists(SKY + "sky.json"):
+		night = JSON.parse_string(FileAccess.get_file_as_string(SKY + "sky.json"))
+		var mat := PanoramaSkyMaterial.new()
+		mat.panorama = load(SKY + "panorama.png")
+		mat.filter = false
+		env.sky = Sky.new()
+		env.sky.sky_material = mat
+		env.sky_rotation.y = PI
+		moon.rotation_degrees = Vector3(-40, 180, 0)
+		moon.light_color = Color(night["light"])
+		moon.light_energy = night["energy"] * 2.5  # brighter than its sky says: out here it is most of the light
+		moon.shadow_enabled = true
+	moon.hide()
+	world.add_child(moon)
 
 
 ## The muzzle flash: a six-pointed star drawn here, and its light, up for a frame or two.
@@ -248,15 +288,22 @@ func _ui() -> void:
 	dot.set_anchors_preset(Control.PRESET_CENTER)
 	dot.position -= Vector2(2, 2)
 	var keys := Label.new()
-	keys.text = "left button fire, right aim, R reload, wheel or 1-%d guns, F torch, Esc out" % mini(9, guns.size())
+	keys.name = "Keys"
+	var melee := guns.any(func(g): return g.has("melee"))
+	keys.text = ("left button swing, right use" if melee else "left button fire, right aim, R reload") \
+			+ ", wheel or 1-%d %s, F torch, Esc out" % [mini(9, guns.size()), "to change" if melee else "guns"]
 	keys.position = Vector2(20, 16)
 	keys.modulate = Color(1, 1, 1, 0.5)
 	keys.visible = not still
-	for c in [ammo_label, note, keys]:
+	prompt.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	prompt.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	prompt.position.y += 40
+	prompt.modulate = Color(1, 1, 1, 0.8)
+	for c in [ammo_label, note, keys, prompt]:
 		c.add_theme_color_override("font_shadow_color", Color.BLACK)
 		c.add_theme_constant_override("shadow_offset_x", 2)
 		c.add_theme_constant_override("shadow_offset_y", 2)
-	for c in [ammo_label, note, dot, keys]:
+	for c in [ammo_label, note, dot, keys, prompt]:
 		hud.add_child(c)
 
 
@@ -311,6 +358,40 @@ func show_prop(i: int) -> void:
 		b.queue_free()
 	for a in p["anims"]:
 		_button(anim_bar, a["name"], func() -> void: play(a["name"]))
+	if p.has("pickup") and inspect:
+		_button(anim_bar, "Inspect", inspect_shown)
+		info.text += ("  |  " if p["note"] else "") + "I to inspect"
+
+
+## The shown prop held up in the inspect view.
+func inspect_shown() -> void:
+	if inspect and not all_view and shown.get_child_count() > 0:
+		inspect.lines = 240 if psx_on else 0
+		inspect.open(shown.get_child(0))
+		_convert(inspect.item)
+
+
+## The first placed `name` (or, if none is, the prop on its own) held up in the inspect view; with
+## `reveal`, its reveal played through: for a capture.
+func inspect_prop(name: String, reveal := false) -> void:
+	var node: Node3D
+	for n in shown.get_children():
+		if n.has_meta("prop") and n.get_meta("prop")["name"] == name:
+			node = n
+			break
+	if not node:
+		var names: Array = props.map(func(p): return p["name"])
+		node = _place(props[names.find(name)], Vector3(0, -100, 0))
+	inspect.lines = 240 if psx_on else 0
+	inspect.open(node)
+	_convert(inspect.item)
+	if reveal:
+		inspect.reveal_now()
+
+
+func _inspected() -> void:
+	if walker and not still:
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
 
 ## Every prop at once: the wall props on the wall, the floor props before it and the small
@@ -400,11 +481,32 @@ func show_level(plan := true) -> void:
 	for p in props:
 		named[p["name"]] = p
 	var box := AABB()
+	var placed: Array = []
 	for it in level["pieces"]:
 		var n := _place(named[it[0]], _gd(it[1]))
 		n.rotation_degrees.y = it[2]
 		n.visible = not plan or it[1][2] < CUT
 		box = box.expand(n.position)
+		placed.append(n)
+		if it[0] in level.get("running", []):  # its loop plays, each from its own point in it
+			var a: Dictionary = named[it[0]]["anims"].filter(func(x): return x["loop"])[0]
+			var player := n.find_child("AnimationPlayer", true, false) as AnimationPlayer
+			player.play(a["name"])
+			player.seek(fposmod(n.position.x * 0.37 + n.position.z * 0.61, 1.0) * a["seconds"], true)
+	machines = {}
+	items = []
+	for m in level.get("machines", []):
+		machines[m["id"]] = placed[m["piece"]]
+	for m in level.get("machines", []):
+		machines[m["id"]].wire(m.get("needs", []).map(func(id): return machines[id]))
+		machines[m["id"]].refused.connect(_refused)
+		machines[m["id"]].picked.connect(_picked)
+	for n in placed:
+		if n.has_signal("saved"):  # a pickup
+			if not n.refused.is_connected(_refused):
+				n.refused.connect(_refused)
+				n.picked.connect(_picked)
+			n.saved.connect(_saved.bind(n))
 	for l in level.get("lights", []):
 		var o := OmniLight3D.new()
 		o.position = _gd(l["at"])
@@ -414,6 +516,10 @@ func show_level(plan := true) -> void:
 		o.set_meta("energy", o.light_energy)
 		o.set_meta("flicker", l.get("flicker", false))
 		shown.add_child(o)
+		if l.has("needs"):  # on while its machine is live
+			var m: Node = machines[l["needs"]]
+			o.visible = m.live
+			m.live_changed.connect(o.set_visible)
 	if plan:
 		env.ambient_light_energy = 0.5
 		env.fog_density = 0.01
@@ -433,6 +539,11 @@ func walk(on: bool) -> void:
 	if on:
 		show_level(false)
 		_on_foot(_gd(level["start"]), deg_to_rad(level["start"][3]) + PI)
+		if not machines.is_empty():
+			hud.show()
+			hud.get_node("Keys").hide()
+			ammo_label.text = ""
+			_say(level.get("puzzle", {}).get("goal", ""), 8.0)
 	else:
 		_off_foot()
 		show_level()
@@ -465,6 +576,7 @@ func _on_foot(at: Vector3, turn: float) -> void:
 
 
 func _off_foot() -> void:
+	hud.hide()
 	walker.queue_free()
 	walker = null
 	torch.queue_free()
@@ -472,7 +584,8 @@ func _off_foot() -> void:
 	ui.visible = not still
 
 
-## The range, on foot with a gun in hand, or back out to the prop.
+## The range, on foot with a gun (or a melee weapon) in hand, or back out to the prop. With no guns,
+## the booths and their shelf are left out and the targets stand close, to walk up to and strike.
 func firing_range(on: bool) -> void:
 	if on == ranging or guns.is_empty():
 		return
@@ -492,23 +605,26 @@ func firing_range(on: bool) -> void:
 	all_view = true
 	ranging = true
 	_clear()
+	hud.get_node("Keys").show()
 	_dark(false)
 	for b in anim_bar.get_children():
 		b.queue_free()
-	_range_room()
+	var shooting := guns.any(func(g): return g.has("gun"))
+	_range_room(shooting)
 	var named := {}
 	for p in props:
 		named[p["name"]] = p
 	var targets := props.filter(func(p): return p["group"] == "targets")
-	var spots := [Vector3(-0.3, 0, -5.5), Vector3(1.7, 0, -7.5), Vector3(-1.8, 0, -9), Vector3(0.8, 0, -11.5), Vector3(-3.0, 0, -13)]
+	var spots := [Vector3(-0.3, 0, -5.5), Vector3(1.7, 0, -7.5), Vector3(-1.8, 0, -9), Vector3(0.8, 0, -11.5), Vector3(-3.0, 0, -13)] \
+			if shooting else [Vector3(0.0, 0, -0.1), Vector3(1.9, 0, -1.2), Vector3(-1.9, 0, -1.6), Vector3(0.9, 0, -3.4), Vector3(-1.0, 0, -4.4)]
 	for k in spots.size() if targets else 0:
-		_place(targets[k % targets.size()], spots[k])
+		_place(targets[k % targets.size()], spots[k]).rotation.y = 0.0 if shooting else -0.25 * spots[k].x
 	if "ammo_crate" in named:
 		_place(named["ammo_crate"], Vector3(3.2, 0, 3.2)).rotation_degrees.y = -20
 	loaded = {}
 	spare = {}
 	var ammo: Array = []
-	for g in guns:
+	for g in guns.filter(func(x): return x.has("gun")):
 		var a: String = g["gun"]["ammo"]
 		loaded[g["name"]] = g["gun"]["rounds"]
 		spare[a] = maxi(spare.get(a, 0), g["gun"]["rounds"] * 2)
@@ -525,9 +641,64 @@ func firing_range(on: bool) -> void:
 	equip(0)
 
 
-## An indoor range: booths at the firing line (z 0) and lanes down to a backstop, lit by
-## fluorescent tubes between the baffles under its ceiling.
-func _range_room() -> void:
+## The level's puzzle solved, as its "uses" say ([machine id, part] each, an item's id to pick it
+## up), everything moved to where it ends: for a capture.
+func solve() -> void:
+	for u in level["puzzle"]["uses"]:
+		var use: Array = u if u is Array else [u, ""]
+		machines[use[0]].use(items, use[1])
+		for i in 3:  # a slot's item, a lever's clip, the door they open
+			for m in machines.values():
+				m.settle()
+
+
+func _refused(why: String) -> void:
+	match why:
+		"power":
+			_say("No power")
+		"code":
+			_say("Wrong code")
+		_:
+			_say("It needs the %s" % _title(why).to_lower())
+
+
+func _picked(item: String) -> void:
+	_say("Picked up the %s" % _title(item).to_lower())
+	ammo_label.text = _carried()
+
+
+func _saved(at: Node) -> void:
+	_say("The game is saved" + (" (%d %s left)" % [items.count(at.takes), _title(at.takes).to_lower()] if at.takes else ""))
+	ammo_label.text = _carried()
+
+
+## What is carried, a line each, with how many where more than one.
+func _carried() -> String:
+	var lines: Array = []
+	for it in items:
+		var line: String = _title(it) + ("  x%d" % items.count(it) if items.count(it) > 1 else "")
+		if line not in lines:
+			lines.append(line)
+	return "\n".join(lines)
+
+
+func _title(item: String) -> String:
+	for p in props:
+		if p.get("use", {}).get("item", "") == item:
+			return p["title"]
+		if p.get("pickup", {}).get("item", "") == item:
+			return p["pickup"].get("title", p["title"])
+	return item.capitalize()
+
+
+func _say(text: String, seconds := 2.5) -> void:
+	note.text = text
+	note_left = seconds
+
+
+## An indoor range: booths at the firing line (z 0), for `shooting`, and lanes down to a backstop,
+## lit by fluorescent tubes between the baffles under its ceiling.
+func _range_room(shooting := true) -> void:
 	const W := 4.0  # half its width
 	const H := 3.0
 	ground.visible = false
@@ -554,9 +725,10 @@ func _range_room() -> void:
 	_block(Vector3(2 * W, H, 0.02), Vector3(0, H / 2, 4.0), Color(0.46, 0.45, 0.41))
 	_block(Vector3(2 * W, H, 0.3), Vector3(0, H / 2, -BACKSTOP), Color(0.1, 0.09, 0.08))  # rubber backstop
 	_block(Vector3(2 * W, 0.6, 1.2), Vector3(0, H - 0.3, -BACKSTOP + 0.6), Color(0.16, 0.15, 0.14))  # its hood
-	for x in [-2.6, -1.0, 1.0, 2.6]:  # booth partitions and the shelf across them
+	for x in [-2.6, -1.0, 1.0, 2.6] if shooting else []:  # booth partitions and the shelf across them
 		_block(Vector3(0.06, 1.7, 1.0), Vector3(x, 0.85, 0.5), Color(0.2, 0.23, 0.23), true)
-	_block(Vector3(2 * W, 0.05, 0.35), Vector3(0, 1.0, 0.18), Color(0.22, 0.19, 0.16), true)
+	if shooting:
+		_block(Vector3(2 * W, 0.05, 0.35), Vector3(0, 1.0, 0.18), Color(0.22, 0.19, 0.16), true)
 	for z in range(-2, -int(BACKSTOP), -3):  # baffles
 		_block(Vector3(2 * W, 0.5, 0.12), Vector3(0, H - 0.25, z), Color(0.24, 0.23, 0.22))
 	for z in [2.4, -0.5, -3.5, -6.5, -9.5, -12.5]:  # tubes, and a light for each (the web renderer takes 8 a mesh)
@@ -605,7 +777,12 @@ func equip(i: int) -> void:
 	for mi in gun_node.find_children("*", "MeshInstance3D", true, false):
 		(mi as MeshInstance3D).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		(mi as MeshInstance3D).layers = 2
+	if "glint" in gun_node:  # a pickup's
+		gun_node.glint = false
 	reloading = 0.0
+	swinging = 0.0
+	using = 0.0
+	lit = false
 	wait = 0.2
 	kick = 0.0
 	flash.scale = Vector3.ONE * (1.3 if gun["group"] in ["shotguns", "launchers"] else 1.0)
@@ -614,8 +791,11 @@ func equip(i: int) -> void:
 
 ## Fires the gun in hand: a round from it, its "fire" animation and its "cycle" after, a flash and
 ## a kick; a ray from the middle of the view (a spread of pellets from a shotgun) leaves a hole where
-## it lands, and a target plays its animation. Empty, it reloads.
+## it lands, and a target plays its animation. Empty, it reloads. A melee weapon swings.
 func shoot() -> void:
+	if gun.has("melee"):
+		swing()
+		return
 	var g: Dictionary = gun["gun"]
 	if loaded[gun["name"]] <= 0:
 		reload()
@@ -647,16 +827,21 @@ func _bullet(spread: float) -> void:
 	var q := PhysicsRayQueryParameters3D.create(cam.global_position, cam.global_position + to * 60.0)
 	q.exclude = [walker.get_rid()]
 	var hit := cam.get_world_3d().direct_space_state.intersect_ray(q)
-	if hit.is_empty():
-		return
+	if not hit.is_empty():
+		_mark(hit, Vector2(0.025, 0.025), Color(0.03, 0.03, 0.03))
+
+
+## A mark of `size` where `hit` (a ray's) landed, turned `turn` about it, and a target struck
+## plays its animation.
+func _mark(hit: Dictionary, size: Vector2, c: Color, turn := 0.0) -> void:
 	var body: Node3D = hit["collider"]
 	var hole := MeshInstance3D.new()
 	hole.mesh = QuadMesh.new()
-	hole.mesh.size = Vector2(0.025, 0.025)
-	hole.material_override = _flat(Color(0.03, 0.03, 0.03))
+	hole.mesh.size = size
+	hole.material_override = _flat(c)
 	body.add_child(hole)
 	var n: Vector3 = hit["normal"]
-	hole.global_transform = Transform3D(Basis.looking_at(-n, Vector3.RIGHT if absf(n.y) > 0.9 else Vector3.UP),
+	hole.global_transform = Transform3D(Basis(n, turn) * Basis.looking_at(-n, Vector3.RIGHT if absf(n.y) > 0.9 else Vector3.UP),
 			hit["position"] + n * 0.003)
 	holes.append(hole)
 	if holes.size() > HOLES:
@@ -695,19 +880,103 @@ func _reloaded() -> void:
 
 
 func _hud() -> void:
+	if gun.has("melee"):
+		ammo_label.text = gun["title"] + ("\non" if lit else "")
+		return
 	var g: Dictionary = gun["gun"]
 	ammo_label.text = "%s\n%d  /  %d" % [gun["title"], loaded[gun["name"]], spare.get(g["ammo"], 0)]
 
 
+## Swings the melee weapon in hand: its swing animation, its blow landing `hit` of the way through.
+func swing() -> void:
+	var m: Dictionary = gun["melee"]
+	if not m.has("swing") or swinging > 0 or using > 0:
+		return
+	var player := gun_node.find_child("AnimationPlayer", true, false) as AnimationPlayer
+	player.stop()
+	player.play(m["swing"])
+	swing_time = player.get_animation(m["swing"]).length
+	swinging = swing_time
+	struck = false
+
+
+## The blow: a ray `reach` long down the middle of the view, a gash from an edge or a dent from the
+## rest where it lands, and a shake.
+func _blow() -> void:
+	var q := PhysicsRayQueryParameters3D.create(cam.global_position,
+			cam.global_position - cam.global_basis.z * float(gun["melee"]["reach"]))
+	q.exclude = [walker.get_rid()]
+	var hit := cam.get_world_3d().direct_space_state.intersect_ray(q)
+	if hit.is_empty():
+		return
+	if gun["group"] in ["blades", "tools"]:
+		_mark(hit, Vector2(0.11, 0.012), Color(0.09, 0.03, 0.03), randf_range(-0.5, 0.5) + PI / 4)
+	else:
+		_mark(hit, Vector2(0.045, 0.045), Color(0.1, 0.1, 0.1))
+	kick = 0.6
+
+
+## Uses what is in hand: its use animation; with `toggle`, the half of it that turns it on or off,
+## its light, glowing parts and running loop going with it.
+func use_held() -> void:
+	var m: Dictionary = gun.get("melee", {})
+	if not m.has("use") or swinging > 0 or using > 0:
+		return
+	var player := gun_node.find_child("AnimationPlayer", true, false) as AnimationPlayer
+	var length := player.get_animation(m["use"]).length
+	player.stop()
+	player.play(m["use"])
+	using = length
+	if m.get("toggle", false):
+		if lit:
+			player.seek(length / 2, true)
+		using = length / 2
+
+
+## The use done: a toggle's half held where it ends, and what goes on or off with it.
+func _used() -> void:
+	var m: Dictionary = gun["melee"]
+	if not m.get("toggle", false):
+		return
+	var player := gun_node.find_child("AnimationPlayer", true, false) as AnimationPlayer
+	lit = not lit
+	if lit:
+		player.pause()
+		if m.has("run"):
+			player.play(m["run"])
+	var light := gun_node.find_child("Light", true, false) as Light3D
+	if light:
+		light.visible = lit
+	for part in m.get("glow", []):
+		var mi := gun_node.find_child(part, true, false) as MeshInstance3D
+		var glow: BaseMaterial3D
+		if lit:
+			glow = (mi.mesh.surface_get_material(0) as BaseMaterial3D).duplicate()
+			glow.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mi.material_override = glow
+	_hud()
+
+
 func _range_tick(delta: float) -> void:
 	wait -= delta
+	if using > 0:
+		using -= delta
+		if using <= 0:
+			_used()
+	if swinging > 0:
+		swinging -= delta
+		if not struck and 1.0 - swinging / swing_time >= gun["melee"]["hit"]:
+			struck = true
+			_blow()
+		if swinging <= 0 and lit and gun["melee"].has("run"):
+			(gun_node.find_child("AnimationPlayer", true, false) as AnimationPlayer).play(gun["melee"]["run"])
 	if reloading > 0:
 		reloading -= delta
 		if reloading <= 0:
 			_reloaded()
-	elif firing and wait <= 0:
+	elif firing and wait <= 0 and swinging <= 0:
 		shoot()
-		firing = firing and gun["gun"].get("auto", false)
+		firing = firing and gun.get("gun", gun.get("melee", {})).get("auto", false)
 	for n in shown.get_children():
 		if not n.has_meta("ammo"):
 			continue
@@ -734,6 +1003,11 @@ func _viewmodel(delta: float) -> void:
 	var speed := Vector2(walker.velocity.x, walker.velocity.z).length()
 	bob += delta * speed * 3.2
 	var step := Vector3(cos(bob) * 0.008, -absf(sin(bob)) * 0.01, 0) * minf(1.0, speed) * (1.0 - aim * 0.8)
+	note_left -= delta
+	note.visible = note_left > 0
+	if gun.has("melee"):
+		_held(step)
+		return
 	var s := _gd(gun["gun"]["sight"])
 	# turned round, its sight under the middle of the view: at arm's length for a handgun; a long gun
 	# held a hand ahead of its butt and low enough to see over its stock
@@ -753,19 +1027,57 @@ func _viewmodel(delta: float) -> void:
 	flash_light.visible = flash.visible
 	flash.position = gun_node.transform * (_gd(gun["gun"]["muzzle"]) + Vector3(0, 0, 0.05))
 	flash_light.position = flash.position
-	note_left -= delta
-	note.visible = note_left > 0
 
 
-## Opens (or shuts) the nearest thing in front that moves: a door plays its animation to the half,
-## where it stands open, and on from there to shut; a loop starts or stops.
+## A melee weapon or tool in hand, low at the right: one longer than tall (a knife, a flashlight, a
+## chainsaw) held point forward; a small one (a lighter) up, its face to you; the rest head up,
+## leaning away and in, its side to you; dipping across the view as it swings.
+func _held(step: Vector3) -> void:
+	var size: Array = gun["size"]
+	var arc := sin(clampf(1.0 - swinging / swing_time, 0, 1) * PI) if swinging > 0 else 0.0
+	var at := Vector3(0.3, -0.45, -0.4)
+	var lean := Vector3(0.65, 0.35, -0.1)
+	var lift := Vector3(-0.2, 0.24, -0.05)  # the hand's, at the height of a swing: up and across
+	if size.max() < 0.1:
+		at = Vector3(0.12, -0.14, -0.3)
+		lean = Vector3(0.1, PI - 0.5, 0)
+	elif size[1] > size[2]:
+		at = Vector3(0.16, -0.19, -0.32)
+		lean = Vector3(0.05, 0.08, 0.1)
+		lift = Vector3(-0.08, 0.04, 0)
+	gun_node.position = at + step + lift * arc + Vector3(sway.x, sway.y, kick * 0.03)
+	gun_node.rotation = lean + Vector3(sway.y * 2.0, PI - sway.x * 2.0, arc * 0.3)
+	cam.fov = 70.0
+	hud.get_node("Dot").visible = true
+	flash.visible = false
+	flash_light.visible = false
+
+
+## Uses the machine the dot is on; or opens (or shuts) the nearest thing in front that moves: a door
+## plays its animation to the half, where it stands open, and on from there to shut; a loop starts
+## or stops.
 func use() -> void:
+	var ray := PhysicsRayQueryParameters3D.create(cam.global_position, cam.global_position - cam.global_basis.z * 2.2)
+	ray.exclude = [walker.get_rid()]
+	var hit := world.get_world_3d().direct_space_state.intersect_ray(ray)
+	var node: Node = hit.get("collider")
+	while node and not node.has_meta("prop"):
+		node = node.get_parent()
+	if node and node.has_method("use"):
+		if node.use(items, String(hit["collider"].get_parent().name)) and inspect and node.has_signal("saved") \
+				and node.kind == "item":
+			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+			inspect.lines = 240 if psx_on else 0
+			inspect.open(node)
+			_convert(inspect.item)
+		ammo_label.text = _carried()
+		return
 	var fwd := -cam.global_basis.z
 	fwd = Vector3(fwd.x, 0, fwd.z).normalized()
 	var best: Node3D
 	var near := 2.0
 	for n in shown.get_children():
-		if not n.has_meta("prop") or n.get_meta("prop")["anims"].is_empty():
+		if not n.has_meta("prop") or n.get_meta("prop")["anims"].is_empty() or n.has_method("use"):
 			continue
 		var to: Vector3 = n.global_position - walker.global_position
 		to.y = 0
@@ -793,6 +1105,23 @@ func use() -> void:
 		best.set_meta("open", true)
 
 
+## What E would do to the pickup the dot is on, if it is on one.
+func _prompt() -> String:
+	var ray := PhysicsRayQueryParameters3D.create(cam.global_position, cam.global_position - cam.global_basis.z * 2.2)
+	ray.exclude = [walker.get_rid()]
+	var node: Node = world.get_world_3d().direct_space_state.intersect_ray(ray).get("collider")
+	while node and not node.has_meta("prop"):
+		node = node.get_parent()
+	if not node or not node.has_signal("saved") or not node.visible:
+		return ""
+	match node.kind:
+		"save":
+			return "E  Save" + (" (an %s)" % _title(node.takes).to_lower() if node.takes else "")
+		"storage":
+			return "E  Shut it" if node.live else "E  Open it"
+	return "E  Take the %s" % (node.title if node.title else node.get_meta("prop")["title"]).to_lower()
+
+
 func _dark(on: bool) -> void:
 	sun.visible = not on
 	rim.visible = not on
@@ -802,12 +1131,22 @@ func _dark(on: bool) -> void:
 	env.fog_density = 0.07 if on else 0.04
 	cam.fov = 62 if on else 40  # wide, in the rooms
 	rise = 0.2
+	var sky := on and not night.is_empty()
+	moon.visible = sky
+	if sky:  # out of doors: the moon lights it, and the fog lets the trees be seen further
+		env.ambient_light_energy = 0.3
+		env.fog_density = 0.045
+	env.background_mode = Environment.BG_SKY if sky else Environment.BG_COLOR
+	env.fog_light_color = Color(night["fog"]) if sky else Color(0.04, 0.04, 0.05)
+	env.fog_sky_affect = 0.0 if sky else 1.0
 
 
 func _physics_process(delta: float) -> void:
 	if not walker:
 		return
 	var move := Vector3(_key(KEY_D, KEY_RIGHT) - _key(KEY_A, KEY_LEFT), 0, _key(KEY_S, KEY_DOWN) - _key(KEY_W, KEY_UP))
+	if inspect and inspect.showing:
+		move = Vector3.ZERO
 	var speed := 4.0 if Input.is_physical_key_pressed(KEY_SHIFT) else 2.2
 	move = Basis(Vector3.UP, yaw) * move.limit_length(1.0) * speed
 	walker.velocity = Vector3(move.x, walker.velocity.y - 9.8 * delta, move.z)
@@ -987,6 +1326,10 @@ func _process(delta: float) -> void:
 		cam.far = 60.0
 		if ranging:
 			_viewmodel(delta)
+		else:
+			note_left -= delta
+			note.visible = note_left > 0
+			prompt.text = _prompt() if inspect and not inspect.showing else ""
 		return
 	idle += delta
 	if not still and idle > 3.0:
@@ -1012,6 +1355,9 @@ func _unhandled_input(event: InputEvent) -> void:
 				match event.button_index:
 					MOUSE_BUTTON_LEFT:
 						firing = event.pressed
+					MOUSE_BUTTON_RIGHT when gun.has("melee"):
+						if event.pressed:
+							use_held()
 					MOUSE_BUTTON_RIGHT:
 						aiming = event.pressed
 					MOUSE_BUTTON_WHEEL_UP when event.pressed:
@@ -1064,6 +1410,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				firing_range(true)
 			KEY_P:
 				set_psx(not psx_on)
+			KEY_I:
+				inspect_shown()
 			KEY_1, KEY_2, KEY_3:
 				var anims: Array = props[index]["anims"]
 				var k: int = event.keycode - KEY_1
